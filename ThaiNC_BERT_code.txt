@@ -1,0 +1,257 @@
+## Data pre-processing
+
+import pandas as pd
+
+# Open Thai_NC dataset file
+!gdown --id 1q92YlpjPK5yIB22HxfKgS8oYUZcWZOck
+
+
+# Read .csv file
+df = pd.read_csv("thaincanno_short.csv", encoding="utf-8")
+
+
+# Check class distribution
+df.label.value_counts()
+
+
+# Split data
+# Train:Dev:Test = 60:20:20
+from sklearn.model_selection import train_test_split
+train, dev_test = train_test_split(df, train_size=0.6, random_state=120)
+dev, test = train_test_split(dev_test, test_size=0.5, random_state=120)
+
+
+# Check class distribution
+train.label.value_counts()
+dev.label.value_counts()
+test.label.value_counts()
+
+
+## BERT
+
+# Check GPU info
+gpu_info = !nvidia-smi
+gpu_info = '\n'.join(gpu_info)
+if gpu_info.find('failed') >= 0:
+  print('Not connected to a GPU')
+else:
+  print(gpu_info)
+
+
+# Install BERT libraries
+!pip install transformers
+!pip install datasets
+!pip install sentencepiece
+
+
+# labels >>> sorted list
+labels = sorted(list(set(df['label'].to_list())))
+
+
+# labels >>> index (idx)
+label_to_idx = {label:i for i,label in enumerate(labels)}
+
+
+# Apply function to label column in all datasets
+train['label'] = train['label'].apply(lambda x: label_to_idx[x])
+dev['label'] = dev['label'].apply(lambda x: label_to_idx[x])
+test['label'] = test['label'].apply(lambda x: label_to_idx[x])
+
+label_list = [0] * len(label_to_idx)
+for label in label_to_idx:
+  label_list[label_to_idx[label]] = label
+
+
+# Import BERT Modules
+from transformers import (
+    AutoTokenizer, 
+    AutoModel,
+    AutoModelForSequenceClassification, 
+    AutoConfig,
+
+    Trainer, 
+    TrainingArguments,
+)
+
+from datasets import (
+    Dataset,
+    DatasetDict,
+    Features, Sequence, ClassLabel, Value
+)
+
+
+# Instantiate variables
+model_name = 'airesearch/wangchanberta-base-att-spm-uncased'
+config = AutoConfig.from_pretrained(model_name, num_labels=len(label_list))   # label_list is list of labels, num_labels = 19
+tokenizer = AutoTokenizer.from_pretrained(model_name)
+model = AutoModelForSequenceClassification.from_pretrained(model_name, 
+                                                           config=config)
+
+
+# Drop 'features' column name (Otherwise it will crash!)
+train = train.drop('features', axis=1)   # axis=1 is column
+dev = dev.drop('features', axis=1)
+test = test.drop('features', axis=1)
+
+
+# Create feature dataset dict
+features = Features({       
+                    "context": Value(dtype="string"),
+                    "label": ClassLabel(names=label_list)
+                })
+
+
+# Change DataFrame >> Python dict
+train.to_dict('dict')
+dev.to_dict('dict')
+test.to_dict('dict')
+
+# Create data_set dict (This must be 'Dataset.from_dict', not 'Dataset.from_pandas')
+data_set = DatasetDict({
+                    "train": Dataset.from_dict(train, features=features),
+                    "dev": Dataset.from_dict(dev, features=features),
+                    "test": Dataset.from_dict(test, features=features)
+                    })			
+  
+data_set['train'][0]
+
+# Create function for tokenization
+def tokenize(examples):
+    tokenized_inputs = tokenizer(examples["context"], 
+                                 is_split_into_words=False,   # False if not yet tokenized 
+                                 truncation=True,
+                                 max_length=100)
+    return tokenized_inputs
+
+tokenized_datasets = data_set.map(tokenize, batched=True)
+tokenized_datasets
+
+
+# Check what it looks like (with special token <s>, </s>, and sub-words)
+tokenizer.convert_ids_to_tokens(tokenized_datasets['train'][0]['input_ids'])
+
+
+model_name.split('/')[-1]   # 'wangchanberta-base-att-spm-uncased'
+
+
+# Do the data collator padding
+from transformers import DataCollatorWithPadding
+
+data_collator = DataCollatorWithPadding(tokenizer=tokenizer,
+                                        padding=True) #, pad_to_multiple_of=8) # True = Pad to the longest sequence in the batch
+tokenized_datasets = tokenized_datasets.remove_columns(["context"])           # drop 'context' column name
+
+tokenized_datasets["train"].column_names   # ['label', 'input_ids', 'attention_mask']
+
+tokenized_datasets['dev'][20]
+
+samples = tokenized_datasets["train"][:20]
+samples = {k: v for k, v in samples.items()}
+[len(x) for x in samples["input_ids"]]
+
+batch = data_collator(samples)
+{k: v.shape for k, v in batch.items()}
+
+
+# Check metrics and import accuracy metric
+from datasets import list_metrics, load_metric
+metrics_list = list_metrics()
+load_metric('accuracy')
+
+
+# Create prediction function
+def compute_metrics(eval_pred):
+    metric = load_metric("accuracy")
+    predictions, labels = eval_pred
+    predictions = np.argmax(predictions, axis=1)
+    return metric.compute(predictions=predictions, references=labels)
+
+
+# index >>> label
+idx_to_label = {i:label for label,i in label_to_idx.items()}
+
+
+# Import Trainer
+from transformers import AutoModelForSequenceClassification, TrainingArguments, Trainer
+
+model = AutoModelForSequenceClassification.from_pretrained(
+    model_name, num_labels=19, id2label=idx_to_label, label2id=label_to_idx
+)
+
+
+# Define your training hyperparameters 
+import numpy as np
+
+training_args = TrainingArguments(
+    output_dir="Thai_NC_model",
+    learning_rate=1e-4,             # learning_rate can be finetuned
+    per_device_train_batch_size=16,
+    per_device_eval_batch_size=16,
+    num_train_epochs=10,             # num_train_epochs can be finetuned
+    #weight_decay=0.01,
+    #save_strategy="epoch",
+    evaluation_strategy="steps",
+    eval_steps=5,
+    load_best_model_at_end=True,
+    metric_for_best_model='accuracy'
+)
+
+trainer = Trainer(
+    model=model,
+    args=training_args,
+    train_dataset=tokenized_datasets["train"],
+    eval_dataset=tokenized_datasets["dev"],
+    tokenizer=tokenizer,
+    data_collator=data_collator,
+    compute_metrics=compute_metrics
+)
+
+trainer.train()
+
+
+# Prediction for dev dataset
+predictions_dev = trainer.predict(tokenized_datasets['dev'])
+preds_dev = np.argmax(predictions_dev.predictions, axis=-1)
+
+predicted_labels_dev = [labels[x] for x in preds_dev]      # predicted_labels_dev is what predicted
+gold_dev = [labels[x] for x in predictions_dev.label_ids]  # gold_dev is gold of dev dataset
+
+
+# Report scores for dev dataset
+from sklearn.metrics import classification_report
+print(classification_report(gold_dev, predicted_labels_dev))
+
+
+# Prediction for test dataset
+predictions_test = trainer.predict(tokenized_datasets['test'])
+preds_test = np.argmax(predictions_test.predictions, axis=-1)
+
+predicted_labels_test = [labels[x] for x in preds_test]      # predicted_labels_test is what predicted
+gold_test = [labels[x] for x in predictions_test.label_ids]  # gold_test is gold of test dataset
+
+
+# Report scores for test dataset
+from sklearn.metrics import classification_report
+print(classification_report(gold_test, predicted_labels_test))
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

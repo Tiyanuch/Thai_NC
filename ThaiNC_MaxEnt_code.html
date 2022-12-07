@@ -1,0 +1,336 @@
+## Data pre-processing
+
+import pandas as pd
+
+# Open Thai_NC dataset file
+!gdown --id 1HUVeh7bGjVhv7o3hKLYphbD1Jx4KVRCJ
+
+
+# Read .csv file
+df = pd.read_csv("all_thai_nc_tokenized.csv", encoding="utf-8")
+
+
+# Check class distribution
+df.label.value_counts()
+
+
+# Split data
+# Train:Dev:Test = 60:20:20
+
+
+from sklearn.model_selection import train_test_split
+train, dev_test = train_test_split(df, train_size=0.6, random_state=120)
+dev, test = train_test_split(dev_test, test_size=0.5, random_state=120)
+
+
+# Open files
+train = pd.read_csv("train_nc_tokenized.csv", encoding="utf-8")
+dev = pd.read_csv("dev_nc_tokenized.csv", encoding="utf-8")
+test = pd.read_csv("test_nc_tokenized.csv", encoding="utf-8")
+
+
+## ----------------------------------------------
+## Train pre-trained word embedding with Word2Vec
+
+# Download word2vec
+!git clone https://github.com/tmikolov/word2vec
+!cd word2vec && make
+
+
+# TNC: download .txt file
+!gdown --id 1KzQFUSHzhjNn-QozLnTLUqKbmdcJAV6U
+from zipfile import ZipFile
+with ZipFile('TNC3_unicode_tokenized_all.txt.zip') as zipf:
+  zipf.extractall()
+  
+!head -n 20 TNC3_unicode_tokenized_all.txt
+!sed 's/|/ /g' TNC3_unicode_tokenized_all.txt > corpus.txt
+
+!./word2vec/word2vec
+
+#dimension = 300
+!./word2vec/word2vec -train corpus.txt -output TNC_embeddings-300.bin -size 300 -binary 1
+
+
+## ----------------------------------------------
+## Neural Network Basics
+
+# Download TensorFlow
+%tensorflow_version 2.x
+
+import numpy as np
+import pandas as pd
+from numpy.linalg import norm
+from sklearn.metrics import classification_report, confusion_matrix
+from IPython.display import Image, display_png
+from gensim.models import word2vec, KeyedVectors
+from keras.models import Sequential
+from keras.layers import Input, Embedding, Dense, Dropout, Flatten, GlobalAveragePooling1D
+#from keras.utils import to_categorical, plot_model
+from tensorflow.keras.utils import to_categorical, plot_model
+from keras_preprocessing.sequence import pad_sequences  # ต้องเปลี่ยนเป็น from keras_preprocessing.sequence ถึงจะไม่ error
+#from keras.optimizers import RMSprop
+from tensorflow.keras.optimizers import RMSprop
+import matplotlib.pyplot as plt
+plt.style.use('ggplot')
+
+
+!pip install pythainlp
+!pip install attacut
+
+import pythainlp
+import attacut
+
+
+## -----------------------------------------------
+## Load up the pre-trained word embeddings
+
+!gdown --id 14bv_aTSP-8rs_Bkudvpp8zcU3UpyRen6
+
+# word embedding = w2v_model_300
+w2v_model_300 = KeyedVectors.load_word2vec_format('TNC_embeddings-300.bin',              
+                                              binary=True, unicode_errors='ignore')
+
+# vocabulary size of pre-trained model
+vocab_size = len(w2v_model_300.vocab)
+print('vocab size:', vocab_size)        # vocab size: 61658
+
+
+# vector dimension
+vector_dim = (len(w2v_model_300['แก้ว']))
+print('vector dimension:', vector_dim)  # #vector dimension: 300
+
+
+# make weight matrix of word embedding, vocab size+1 (for padding)
+embedding_matrix = np.zeros((vocab_size+1, vector_dim), dtype="float32")
+embedding_matrix[0] = np.zeros(vector_dim)
+
+word_to_index = {word:i+1 for i, word in enumerate(w2v_model_300.vocab)}
+# word to index dictionary, 0 for padding, UNKNOWN
+word_to_index['PADDING'] = 0
+
+for i, word in enumerate(w2v_model_300.vocab):
+    embedding_matrix[i+1] = w2v_model_300[word]
+
+
+## -------------------------------------------------
+## Convert words into indices and pad + truncate sequences
+
+# Convert word >>> index (in word embedding)
+
+def convert_words(df, word_to_index, max_length):  
+  tokens = df['tokenized_features'].apply(lambda x: x.split('|'))
+  list_of_list_of_indices = list(tokens.map(lambda x: [word_to_index.get(word, 0) for word in x]))
+  return pad_sequences(list_of_list_of_indices, max_length, padding='post', value=0, truncating='post')
+
+# pad_sequences got index because each sentence has different word tokens.
+
+# max length
+max_len = 5
+train_x = convert_words(train, word_to_index, max_len)   # train_x is data that is converted from word >> index & do padding
+dev_x = convert_words(dev, word_to_index, max_len)       # train, dev, test are splitted data
+test_x = convert_words(test, word_to_index, max_len)
+
+
+## --------------------------------------------------
+## Mapping labels
+
+# Check numbers of relations
+len(df[["label"]].drop_duplicates())   # 19 relations
+
+# Count freq. of each relation
+count_df = df.groupby(["label"]).size().reset_index(name="Count")
+
+# Map label >>> index
+def get_label(df):
+  feature_to_label = {            # feature_to_label is Python dict (key is label, value is index)
+      'ATTRIBUTE_OF_W1':0, 
+      'ATTRIBUTE_OF_W2':1,
+      'BOTH_W1_W2':2,
+      'GROUP_OF_W2':3,
+      'LEXICALIZED':4,
+      'LOCATION_OF_W1':5,
+      'LOCATION_OF_W2':6,
+      'OTHERS':7,
+      'SOURCE_OF_W1':8,
+      'W1_ABOUT_W2':9,
+      'W1_CONTAIN_W2':10,
+      'W1_FOR_W2':11,
+      'W1_FROM_W2':12,
+      'W1_HAVE_W2':13,
+      'W1_IN_W2':14,
+      'W1_MADE_FROM_W2':15,
+      'W1_OF_W2':16,
+      'W1_SELL_W2':17,
+      'W1_USE_W2':18
+      }
+
+
+  # Apply functions & convert to np.array
+  label = np.array(df['label'].replace(feature_to_label).tolist())  #label name of column in df 
+  df['label'] = label
+  return to_categorical(label, num_classes=19)  # num_classes = 19 (19 relations)
+
+# label : one-hot vector       one-hot vector (1 or 0) 
+train_y = get_label(train)     # becareful the variable name!
+dev_y = get_label(dev)
+test_y = get_label(test)
+
+feature_to_label = {
+    'ATTRIBUTE_OF_W1':0, 
+    'ATTRIBUTE_OF_W2':1,
+    'BOTH_W1_W2':2,
+    'GROUP_OF_W2':3,
+    'LEXICALIZED':4,
+    'LOCATION_OF_W1':5,
+    'LOCATION_OF_W2':6,
+    'OTHERS':7,
+    'SOURCE_OF_W1':8,
+    'W1_ABOUT_W2':9,
+    'W1_CONTAIN_W2':10,
+    'W1_FOR_W2':11,
+    'W1_FROM_W2':12,
+    'W1_HAVE_W2':13,
+    'W1_IN_W2':14,
+    'W1_MADE_FROM_W2':15,
+    'W1_OF_W2':16,
+    'W1_SELL_W2':17,
+    'W1_USE_W2':18
+}
+
+
+label_names = list(feature_to_label.keys())
+len(label_names)  # 19
+
+test_y[0:15]
+train_y[0:15] 
+
+
+# Check the shape
+print('input train:', train_x.shape)  # input train: (1086, 5), 1086 is training set, 5 is max_len
+print('input dev:', dev_x.shape)      # input dev: (362, 5), 362 is dev set  
+print('label train:', train_y.shape)  # label train: (1086, 19), 19 is relation or label
+print('label dev:',dev_y.shape)       # label dev: (362, 19)
+print('input test:', test_x.shape)    # input test: (362, 5) 362 is test set
+print('label test:', test_y.shape)    # label test: (362, 19)
+
+
+## Train the model
+# Instantiation
+model = Sequential()
+
+# Add embedding layer
+model.add(Embedding(input_dim=vocab_size+1,
+                    input_length=max_len,
+                    output_dim=vector_dim, 
+                    weights=[embedding_matrix],   # embedding_matrix is from dimension of word embedding
+                    mask_zero=True,
+                    trainable=True))    # True = weight is not frozen
+
+# Average
+model.add(GlobalAveragePooling1D())
+
+# Add hidden layer
+model.add(Dense(150, activation='relu')) # 150 = No.of hidden layers
+
+# add output layer
+model.add(Dense(19, activation='softmax'))  # 19 is No.of labels
+
+# compile model
+model.compile(optimizer="rmsprop", loss="categorical_crossentropy", metrics=["accuracy"])
+
+model.summary()
+
+
+# Plot image of model
+plot_model(model, show_shapes=True,to_file='Tnc300_model.png')
+display_png(Image('Tnc300_model.png'))
+
+
+# Train
+history = model.fit(train_x, train_y, batch_size=20, epochs=20, validation_data=(dev_x, dev_y))  # batch_size=20, epochs=20
+
+
+# Plot graph for accuracy
+plt.plot(history.history['accuracy'])
+plt.plot(history.history['val_accuracy'])
+plt.ylabel('accuracy')
+plt.xlabel('epoch')
+plt.legend(['train', 'dev'], loc='best')
+plt.show()
+
+
+# Plot graph for loss
+plt.plot(history.history['loss'])
+plt.plot(history.history['val_loss'])
+plt.ylabel('loss')
+plt.xlabel('epoch')
+plt.legend(['train', 'dev'], loc='best')
+plt.show()
+
+
+# Report F1 score of dev set
+prediction_dev = [np.argmax(x) for x in model.predict(dev_x)]  # dev_x is dev dataset
+print(classification_report(dev['label'], prediction_dev))     # prediction_dev is prediction
+
+
+# Report F1 score of test set
+prediction_test = [np.argmax(x) for x in model.predict(test_x)]  # test_x is test dataset
+print(classification_report(test['label'], prediction_test))     # prediction_test is prediction
+
+
+##### ------------------------------------------------------------------------------------------- #####
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+ 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
